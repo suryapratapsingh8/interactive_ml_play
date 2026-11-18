@@ -19,6 +19,9 @@ class DatasetInspectionResponse(BaseModel):
     total_rows: int
     clean_non_nan_rows: int
     nan_rows_count: int
+    nan_row_pct: float
+    recommended_nan_strategy: str
+    nan_recommendation_reason: str
     columns: List[str]
     default_target: str
     detected_task_type: str
@@ -48,7 +51,16 @@ class ExperimentConfig(BaseModel):
     dataset_id: str = Field(default="iris")
     target_column: Optional[str] = Field(default=None)
     task_type: Optional[str] = Field(default="auto")
-    sample_size: int = Field(default=250, ge=20, le=2000)
+    sample_percentage: float = Field(
+        default=60.0,
+        ge=20.0,
+        le=80.0,
+        description="Percentage of available dataset rows to randomly sample (20% to 80%)",
+    )
+    nan_strategy: str = Field(
+        default="auto",
+        description="NaN handling: 'auto' (recommended), 'drop', 'median_mode', 'mean_mode', 'knn_impute', 'ffill_bfill', or 'constant_zero'",
+    )
     random_state: int = Field(default=42)
     test_size: float = Field(default=0.2, ge=0.1, le=0.5)
     cv_folds: int = Field(default=5, ge=2, le=10)
@@ -68,10 +80,15 @@ class ManualPlaygroundConfig(BaseModel):
         default="rf_clf",
         description="Specific algorithm ID chosen by user in the Manual Playground",
     )
-    sample_size: int = Field(default=250, ge=20, le=2000)
+    sample_percentage: float = Field(
+        default=60.0,
+        ge=20.0,
+        le=80.0,
+        description="Percentage of available dataset rows to randomly sample (20% to 80%)",
+    )
     nan_strategy: str = Field(
-        default="drop",
-        description="'drop' (strictly drop NaN rows) or 'median_mode' (impute missing values)",
+        default="auto",
+        description="NaN handling: 'auto' (recommended), 'drop', 'median_mode', 'mean_mode', 'knn_impute', 'ffill_bfill', or 'constant_zero'",
     )
     random_state: int = Field(default=42)
     test_size: float = Field(default=0.2, ge=0.1, le=0.5)
@@ -120,10 +137,14 @@ class ModelResult(BaseModel):
 
 class SamplingSummary(BaseModel):
     original_rows: int
-    rows_after_nan_drop: int
+    rows_after_nan_handling: int
+    nan_rows_in_raw: int
     nan_rows_removed: int
+    nan_strategy_requested: str
+    nan_strategy_applied: str
+    nan_recommendation_reason: str
     sampled_rows: int
-    target_sample_size: int
+    sample_percentage_used: float
     train_rows: int
     test_rows: int
     numeric_features: List[str]
