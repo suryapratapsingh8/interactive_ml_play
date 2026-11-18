@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
@@ -11,13 +11,14 @@ from datasets import (
     inspect_dataset_columns,
     list_available_datasets,
     load_dataset,
+    recommend_nan_strategy,
     register_uploaded_csv,
 )
 from pipeline import (
     run_experiment,
     run_hyperparameter_sweep,
     run_manual_playground,
-    sample_clean_250_rows,
+    sample_percentage_rows,
 )
 from schemas import (
     DatasetInspectionResponse,
@@ -34,11 +35,11 @@ app = FastAPI(
     title="ML Algorithm Selector & Interactive Manual Learning Playground API",
     description=(
         "Production-grade FastAPI platform featuring: (1) Workflow Mode Selector, "
-        "(2) Dataset Studio with Target Column Dropdown & Intelligent Task-Type Detection, "
-        "(3) Auto Algorithm Selector (~250 clean non-NaN rows, Tier 0 → Tier 6), and "
+        "(2) Dataset Studio with Target Column Dropdown, Intelligent Task-Type Detection & Proactive NaN Strategy Suggestion, "
+        "(3) Auto Algorithm Selector (20%–80% Sampling, Tier 0 → Tier 6), and "
         "(4) Manual Hyperparameter Tuning & Feature Tweaking Playground."
     ),
-    version="2.0.0",
+    version="2.1.0",
 )
 
 app.add_middleware(
@@ -52,24 +53,27 @@ app.add_middleware(
 BASE_DIR = Path(__file__).resolve().parent
 
 
+def _to_dict(obj) -> dict:
+    return obj.model_dump() if hasattr(obj, "model_dump") else obj.dict()
+
+
 # --- 1. System & Mode Discovery Endpoints ---
 @app.get("/api/health", tags=["System & Navigation"])
 def health_check() -> dict:
     return {
         "status": "ok",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "service": "ML Algorithm Selector & Manual Learning Playground",
-        "total_endpoints": 16,
+        "total_endpoints": 17,
     }
 
 
 @app.get("/api/modes", tags=["System & Navigation"])
 def get_workflow_modes() -> dict:
-    """Returns the interactive workflow modes shown on the initial 'What do you want to do?' selector."""
     return {"modes": WORKFLOW_MODES}
 
 
-# --- 2. Dataset Studio, Upload, Target Column Dropdown & Intelligent Task Detection Endpoints ---
+# --- 2. Dataset Studio, Upload, Target Dropdown & Proactive NaN Recommendation Endpoints ---
 @app.get("/api/datasets", tags=["Dataset Studio & Target Detection"])
 def get_datasets() -> dict:
     return {"datasets": list_available_datasets()}
@@ -81,10 +85,6 @@ async def upload_custom_dataset(
     target_column: Optional[str] = Form(default=None),
     task_type: str = Form(default="auto"),
 ) -> dict:
-    """
-    Uploads a custom CSV dataset, extracts all column names for the Target Column dropdown,
-    and runs intelligent task detection (Classification vs. Regression) if task_type is 'auto'.
-    """
     if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Please upload a valid .csv file.")
     content = await file.read()
@@ -106,12 +106,41 @@ async def upload_custom_dataset(
 )
 def inspect_dataset(
     dataset_id: str,
-    target_column: Optional[str] = Query(default=None, description="Optional target column to inspect"),
-    task_type: str = Query(default="auto", description="'auto', 'classification', or 'regression'"),
+    target_column: Optional[str] = Query(default=None),
+    task_type: str = Query(default="auto"),
 ) -> DatasetInspectionResponse:
-    """Returns full column dropdown list, missing value stats, and intelligent task-type recommendation."""
     try:
         return inspect_dataset_columns(dataset_id, target_column, task_type)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/datasets/{dataset_id}/recommend-nan-strategy", tags=["Dataset Studio & Target Detection"])
+def get_nan_strategy_recommendation(
+    dataset_id: str,
+    target_column: Optional[str] = Query(default=None),
+) -> dict:
+    """Proactively analyzes dataset missingness & skewness to suggest the optimal NaN strategy before user selection."""
+    try:
+        df, default_target, _ = load_dataset(dataset_id)
+        t_col = target_column if (target_column and target_column in df.columns) else default_target
+        strategy, reason, nan_pct = recommend_nan_strategy(df, t_col)
+        return {
+            "dataset_id": dataset_id,
+            "target_column": t_col,
+            "nan_row_pct": nan_pct,
+            "recommended_nan_strategy": strategy,
+            "reason": reason,
+            "available_strategies": [
+                {"id": "auto", "label": f"Auto (Use Suggested: {strategy})"},
+                {"id": "drop", "label": "Remove / Drop NaN Rows"},
+                {"id": "median_mode", "label": "Median (Numeric) / Mode (Categorical) Imputer"},
+                {"id": "mean_mode", "label": "Mean (Numeric) / Mode (Categorical) Imputer"},
+                {"id": "knn_impute", "label": "KNN Imputer (Distance-Weighted Neighbors)"},
+                {"id": "ffill_bfill", "label": "Forward Fill / Backward Fill (Sequential)"},
+                {"id": "constant_zero", "label": "Constant Fill (0 / 'Missing')"},
+            ],
+        }
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -127,11 +156,14 @@ def get_dataset_columns(dataset_id: str) -> dict:
         "total_rows": info.total_rows,
         "clean_rows": info.clean_non_nan_rows,
         "nan_rows": info.nan_rows_count,
+        "nan_row_pct": info.nan_row_pct,
+        "recommended_nan_strategy": info.recommended_nan_strategy,
+        "nan_recommendation_reason": info.nan_recommendation_reason,
         "columns": info.columns,
         "default_target": info.default_target,
         "default_task_type": info.detected_task_type,
         "task_detection_reason": info.task_detection_reason,
-        "column_profiles": [(p.model_dump() if hasattr(p, "model_dump") else p.dict()) for p in info.column_profiles],
+        "column_profiles": [_to_dict(p) for p in info.column_profiles],
     }
 
 
@@ -144,10 +176,6 @@ def set_dataset_target_and_task(
     dataset_id: str,
     payload: TargetConfigurationRequest,
 ) -> TargetConfigurationResponse:
-    """
-    Sets the target column from the user's dropdown selection and either applies the user's explicit
-    model type ('classification'/'regression') or intelligently detects the task type ('auto').
-    """
     try:
         return configure_dataset_target(dataset_id, payload.target_column, payload.task_type)
     except ValueError as exc:
@@ -155,20 +183,27 @@ def set_dataset_target_and_task(
 
 
 @app.post("/api/datasets/{dataset_id}/sample-preview", tags=["Dataset Studio & Target Detection"])
-def preview_clean_250_sample(
+def preview_percentage_sample(
     dataset_id: str,
     target_column: Optional[str] = Query(default=None),
-    sample_size: int = Query(default=250, ge=20, le=2000),
-    nan_strategy: str = Query(default="drop"),
+    sample_percentage: float = Query(default=60.0, ge=20.0, le=80.0),
+    nan_strategy: str = Query(default="auto"),
     random_state: int = Query(default=42),
 ) -> dict:
-    """Runs the NaN handler and ~250-row random/stratified sampler and returns a preview of the sampled rows."""
     try:
         df, default_target, _ = load_dataset(dataset_id)
         t_col = target_column if (target_column and target_column in df.columns) else default_target
         info = configure_dataset_target(dataset_id, t_col, "auto")
-        sampled_df, orig, clean, nan_rem = sample_clean_250_rows(
-            df, t_col, sample_size, random_state, info.resolved_task_type, nan_strategy
+        (
+            sampled_df,
+            orig,
+            post_nan,
+            raw_nans,
+            nan_rem,
+            applied_strat,
+            rec_reason,
+        ) = sample_percentage_rows(
+            df, t_col, sample_percentage, random_state, info.resolved_task_type, nan_strategy
         )
         return {
             "dataset_id": dataset_id,
@@ -176,8 +211,12 @@ def preview_clean_250_sample(
             "detected_task_type": info.resolved_task_type,
             "detection_reason": info.intelligent_detection_reason,
             "original_rows": orig,
-            "clean_rows_available": clean,
-            "nan_rows_handled": nan_rem,
+            "rows_after_nan_handling": post_nan,
+            "raw_nan_rows": raw_nans,
+            "nan_rows_removed": nan_rem,
+            "nan_strategy_applied": applied_strat,
+            "nan_recommendation_reason": rec_reason,
+            "sample_percentage_used": sample_percentage,
             "sampled_rows_count": len(sampled_df),
             "sample_rows": sampled_df.head(12).to_dict(orient="records"),
         }
@@ -196,7 +235,6 @@ def remove_custom_dataset(dataset_id: str) -> dict:
 # --- 3. Algorithm Catalog & Hyperparameter Schema Endpoints ---
 @app.get("/api/algorithms", tags=["Algorithms & Hyperparameter Schemas"])
 def list_algorithms(task_type: Optional[str] = Query(default=None)) -> dict:
-    """Lists all algorithms and their tunable hyperparameter controls for the Manual Learning Playground."""
     if task_type in ("classification", "regression"):
         filtered = [a for a in ALGORITHMS_CATALOG if a["task_type"] == task_type]
         return {"algorithms": filtered}
@@ -223,10 +261,6 @@ def get_algorithm_details(algorithm_id: str) -> dict:
     tags=["Auto Algorithm Selector"],
 )
 def execute_auto_selector(config: ExperimentConfig) -> ExperimentResponse:
-    """
-    Drops NaN rows, randomly samples ~250 clean rows, and benchmarks algorithms progressively
-    from Tier 0 (Naive Baseline) to Tier 6 (Gradient Boosting) to determine the best algorithm.
-    """
     try:
         return run_experiment(config)
     except ValueError as exc:
@@ -242,10 +276,6 @@ def execute_auto_selector(config: ExperimentConfig) -> ExperimentResponse:
     tags=["Manual Learning Playground"],
 )
 def train_manual_playground_model(config: ManualPlaygroundConfig) -> ManualPlaygroundResponse:
-    """
-    Trains a single user-selected algorithm with custom hyperparameters, feature exclusions,
-    scaling, polynomial degree, and noise injection for hands-on learning.
-    """
     try:
         return run_manual_playground(config)
     except ValueError as exc:
@@ -256,10 +286,6 @@ def train_manual_playground_model(config: ManualPlaygroundConfig) -> ManualPlayg
 
 @app.post("/api/playground/hyperparameter-sweep", tags=["Manual Learning Playground"])
 def execute_hyperparameter_sweep(req: HyperparameterSweepRequest) -> dict:
-    """
-    Runs a 1D validation curve sweep across a chosen hyperparameter (e.g., max_depth, n_neighbors,
-    regularization, n_estimators, learning_rate) to visualize underfitting vs. overfitting.
-    """
     try:
         return run_hyperparameter_sweep(req)
     except ValueError as exc:
