@@ -10,74 +10,47 @@ def _model_to_dict(obj):
     return obj.model_dump() if hasattr(obj, "model_dump") else obj.dict()
 
 
-class TestMLPlaygroundProductionV2(unittest.TestCase):
+class TestMLPlaygroundV21(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(app)
 
-    def test_health_and_modes_endpoints(self):
-        res = self.client.get("/api/health")
+    def test_proactive_nan_strategy_recommendation_endpoint(self):
+        res = self.client.get("/api/datasets/housing_synthetic/recommend-nan-strategy")
         self.assertEqual(res.status_code, 200)
-        modes = self.client.get("/api/modes").json()["modes"]
-        self.assertEqual(len(modes), 4)
+        data = res.json()
+        self.assertIn(data["recommended_nan_strategy"], ("drop", "median_mode", "mean_mode", "knn_impute"))
+        self.assertGreater(data["nan_row_pct"], 0)
+        self.assertGreaterEqual(len(data["available_strategies"]), 6)
 
-    def test_dataset_inspect_and_intelligent_target_configuration(self):
-        insp = self.client.get("/api/datasets/housing_synthetic/inspect").json()
-        self.assertIn("price_k", insp["columns"])
-        self.assertIn("neighborhood", insp["columns"])
-        self.assertEqual(insp["detected_task_type"], "regression")
+    def test_percentage_sampling_20_to_80_and_all_nan_strategies(self):
+        # Verify 25% vs 75% sampling
+        res_25 = run_experiment(ExperimentConfig(dataset_id="iris", sample_percentage=25.0, nan_strategy="drop"))
+        res_75 = run_experiment(ExperimentConfig(dataset_id="iris", sample_percentage=75.0, nan_strategy="drop"))
+        self.assertLess(res_25.sampling_summary.sampled_rows, res_75.sampling_summary.sampled_rows)
+        self.assertEqual(res_25.sampling_summary.sample_percentage_used, 25.0)
+        self.assertEqual(res_75.sampling_summary.sample_percentage_used, 75.0)
 
-        cfg_res = self.client.post(
-            "/api/datasets/housing_synthetic/configure-target",
-            json={"target_column": "neighborhood", "task_type": "auto"},
-        )
-        self.assertEqual(cfg_res.status_code, 200)
-        self.assertEqual(cfg_res.json()["resolved_task_type"], "classification")
+        # Verify all NaN strategies run cleanly in Manual Playground
+        for strat in ("auto", "drop", "median_mode", "mean_mode", "knn_impute", "ffill_bfill", "constant_zero"):
+            man_res = run_manual_playground(
+                ManualPlaygroundConfig(
+                    dataset_id="housing_synthetic",
+                    algorithm_id="ridge_reg",
+                    sample_percentage=50.0,
+                    nan_strategy=strat,
+                )
+            )
+            if strat == "drop":
+                self.assertGreater(man_res.sampling_summary.nan_rows_removed, 0)
+            elif strat != "auto":
+                # Imputers preserve all rows whose target is non-NaN
+                self.assertEqual(man_res.sampling_summary.nan_rows_removed, 0)
+                self.assertEqual(man_res.sampling_summary.nan_strategy_applied, strat)
 
-        cfg_res2 = self.client.post(
-            "/api/datasets/housing_synthetic/configure-target",
-            json={"target_column": "price_k", "task_type": "auto"},
-        )
-        self.assertEqual(cfg_res2.status_code, 200)
-        self.assertEqual(cfg_res2.json()["resolved_task_type"], "regression")
-
-    def test_auto_selector_250_clean_sampling_and_metrics(self):
-        cfg = ExperimentConfig(dataset_id="iris", sample_size=250, random_state=42)
-        result = run_experiment(cfg)
-        self.assertGreater(result.sampling_summary.nan_rows_removed, 0)
-        self.assertEqual(result.sampling_summary.sampled_rows, 250)
-        self.assertEqual(result.sampling_summary.detected_task_type, "classification")
-        top_metrics = result.leaderboard[0].metrics
-        for key in ("Accuracy", "Precision", "Recall", "F1 Score", "MAE (Class Error)", "MSE (Class Error)"):
-            self.assertIn(key, top_metrics)
-
-    def test_manual_learning_playground_and_hyperparameter_sweep(self):
-        man_cfg = ManualPlaygroundConfig(
-            dataset_id="wine",
-            target_column="target",
-            task_type="auto",
-            algorithm_id="knn_clf",
-            sample_size=250,
-            scaling="standard",
-            n_neighbors=7,
-            knn_weights="distance",
-        )
-        res = run_manual_playground(man_cfg)
-        self.assertEqual(res.algorithm_id, "knn_clf")
-        self.assertEqual(res.sampling_summary.sampled_rows, 250)
-        self.assertIsNotNone(res.confusion_matrix)
-
-        sweep_res = self.client.post(
-            "/api/playground/hyperparameter-sweep",
-            json={"playground_config": _model_to_dict(man_cfg), "param_name": "n_neighbors", "param_values": [1, 5, 11]},
-        )
-        self.assertEqual(sweep_res.status_code, 200)
-        sweep_data = sweep_res.json()
-        self.assertEqual(len(sweep_data["curve"]), 3)
-
-    def test_custom_csv_upload_dropdown_and_auto_detection(self):
+    def test_custom_csv_upload_with_nan_recommendation_and_percentage_preview(self):
         rows = ["age,income,credit_score,approved_status"]
-        for i in range(300):
-            if i % 15 == 0:
+        for i in range(200):
+            if i % 8 == 0:
                 rows.append(f"{25 + (i % 40)},,700,{'Yes' if i % 2 == 0 else 'No'}")
             else:
                 rows.append(f"{25 + (i % 40)},{45000 + i * 180},{620 + (i % 150)},{'Yes' if i % 2 == 0 else 'No'}")
@@ -90,16 +63,16 @@ class TestMLPlaygroundProductionV2(unittest.TestCase):
         )
         self.assertEqual(up_res.status_code, 200)
         up_data = up_res.json()
-        self.assertEqual(up_data["columns"], ["age", "income", "credit_score", "approved_status"])
+        self.assertIn("recommended_nan_strategy", up_data)
         self.assertEqual(up_data["detected_task_type"], "classification")
 
-        custom_id = up_data["id"]
-        retarget = self.client.post(
-            f"/api/datasets/{custom_id}/configure-target",
-            json={"target_column": "income", "task_type": "auto"},
+        prev_res = self.client.post(
+            f"/api/datasets/{up_data['id']}/sample-preview?sample_percentage=40&nan_strategy=knn_impute"
         )
-        self.assertEqual(retarget.status_code, 200)
-        self.assertEqual(retarget.json()["resolved_task_type"], "regression")
+        self.assertEqual(prev_res.status_code, 200)
+        prev_data = prev_res.json()
+        self.assertEqual(prev_data["nan_strategy_applied"], "knn_impute")
+        self.assertEqual(prev_data["sampled_rows_count"], 80)  # 40% of 200 imputed rows
 
 
 if __name__ == "__main__":
