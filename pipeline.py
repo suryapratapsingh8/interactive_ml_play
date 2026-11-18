@@ -7,7 +7,7 @@ from scipy.optimize import minimize
 from scipy.spatial.distance import cdist
 
 from concepts import ALGORITHMS_CATALOG
-from datasets import intelligent_detect_task_type, load_dataset
+from datasets import intelligent_detect_task_type, load_dataset, recommend_nan_strategy
 from schemas import (
     ExperimentConfig,
     ExperimentResponse,
@@ -24,45 +24,130 @@ def detect_task_type(y: pd.Series, requested: Optional[str] = "auto") -> str:
     return task
 
 
-def sample_clean_250_rows(
+def _knn_impute_numeric(df_in: pd.DataFrame, numeric_cols: List[str], k: int = 5) -> pd.DataFrame:
+    """
+    Distance-weighted K-Nearest Neighbors imputation for numeric columns using standardized observed dimensions.
+    """
+    df = df_in.copy()
+    if not numeric_cols:
+        return df
+
+    mat = df[numeric_cols].to_numpy(dtype=float)
+    col_medians = np.nanmedian(mat, axis=0)
+    col_medians = np.where(np.isnan(col_medians), 0.0, col_medians)
+    col_stds = np.nanstd(mat, axis=0)
+    col_stds = np.where((np.isnan(col_stds)) | (col_stds < 1e-9), 1.0, col_stds)
+
+    # Temporarily fill with medians strictly for distance computation
+    mat_filled = np.where(np.isnan(mat), col_medians, mat)
+    mat_norm = (mat_filled - col_medians) / col_stds
+
+    nan_row_indices = np.where(np.isnan(mat).any(axis=1))[0]
+    for r_idx in nan_row_indices:
+        missing_cols = np.where(np.isnan(mat[r_idx]))[0]
+        obs_cols = np.where(~np.isnan(mat[r_idx]))[0]
+        for c_idx in missing_cols:
+            valid_donors = np.where(~np.isnan(mat[:, c_idx]))[0]
+            if len(valid_donors) == 0:
+                mat[r_idx, c_idx] = col_medians[c_idx]
+                continue
+            if len(obs_cols) == 0:
+                mat[r_idx, c_idx] = col_medians[c_idx]
+                continue
+            diff = mat_norm[valid_donors][:, obs_cols] - mat_norm[r_idx, obs_cols]
+            dists = np.sqrt(np.sum(diff ** 2, axis=1))
+            k_eff = min(k, len(valid_donors))
+            nn_pos = np.argsort(dists)[:k_eff]
+            nn_rows = valid_donors[nn_pos]
+            weights = 1.0 / (dists[nn_pos] + 1e-5)
+            mat[r_idx, c_idx] = float(np.sum(weights * mat[nn_rows, c_idx]) / np.sum(weights))
+
+    df[numeric_cols] = mat
+    return df
+
+
+def sample_percentage_rows(
     df: pd.DataFrame,
     target_col: str,
-    sample_size: int = 250,
+    sample_percentage: float = 60.0,
     random_state: int = 42,
     task_type: str = "classification",
-    nan_strategy: str = "drop",
-) -> Tuple[pd.DataFrame, int, int, int]:
+    nan_strategy: str = "auto",
+) -> Tuple[pd.DataFrame, int, int, int, int, str, str]:
     """
-    Handles NaN values ('drop' removes any row with NaN; 'median_mode' imputes numeric medians / categorical modes)
-    and randomly samples `sample_size` (~250) clean rows (stratified for classification).
+    1. Resolves NaN handling strategy ('auto' -> recommended strategy, 'drop', 'median_mode',
+       'mean_mode', 'knn_impute', 'ffill_bfill', or 'constant_zero').
+    2. Randomly samples `sample_percentage` (20% to 80%) of the processed clean rows
+       (using stratified sampling for classification to preserve class balance).
     """
     original_rows = len(df)
     raw_nan_rows = int(len(df) - len(df.dropna(axis=0, how="any")))
+    rec_strategy, rec_reason, _ = recommend_nan_strategy(df, target_col)
 
-    if nan_strategy == "median_mode":
-        clean_df = df.dropna(subset=[target_col]).copy().reset_index(drop=True)
-        for col in clean_df.columns:
-            if col == target_col:
-                continue
-            if pd.api.types.is_numeric_dtype(clean_df[col]):
-                clean_df[col] = clean_df[col].fillna(clean_df[col].median())
-            else:
-                mode_vals = clean_df[col].mode(dropna=True)
-                fill_val = mode_vals.iloc[0] if len(mode_vals) > 0 else "missing"
-                clean_df[col] = clean_df[col].fillna(fill_val)
-        clean_df = clean_df.dropna(axis=0, how="any").reset_index(drop=True)
-        rows_after_nan_drop = len(clean_df)
-        nan_rows_removed = original_rows - rows_after_nan_drop
-    else:
+    applied_strategy = rec_strategy if nan_strategy == "auto" else nan_strategy
+
+    if applied_strategy == "drop":
         clean_df = df.dropna(axis=0, how="any").reset_index(drop=True)
-        rows_after_nan_drop = len(clean_df)
-        nan_rows_removed = raw_nan_rows
+    else:
+        # Target values must always be known for supervised training
+        clean_df = df.dropna(subset=[target_col]).copy().reset_index(drop=True)
+        feature_cols = [c for c in clean_df.columns if c != target_col]
+        num_cols = [c for c in feature_cols if pd.api.types.is_numeric_dtype(clean_df[c])]
+        cat_cols = [c for c in feature_cols if c not in num_cols]
 
-    if rows_after_nan_drop == 0:
-        raise ValueError("No rows remain after handling NaN values. Please check your dataset.")
+        if applied_strategy == "median_mode":
+            for col in num_cols:
+                med = clean_df[col].median()
+                clean_df[col] = clean_df[col].fillna(0.0 if pd.isna(med) else med)
+            for col in cat_cols:
+                mode_vals = clean_df[col].mode(dropna=True)
+                clean_df[col] = clean_df[col].fillna(mode_vals.iloc[0] if len(mode_vals) > 0 else "Missing")
 
-    actual_sample = min(sample_size, rows_after_nan_drop)
-    if actual_sample < rows_after_nan_drop:
+        elif applied_strategy == "mean_mode":
+            for col in num_cols:
+                mn = clean_df[col].mean()
+                clean_df[col] = clean_df[col].fillna(0.0 if pd.isna(mn) else mn)
+            for col in cat_cols:
+                mode_vals = clean_df[col].mode(dropna=True)
+                clean_df[col] = clean_df[col].fillna(mode_vals.iloc[0] if len(mode_vals) > 0 else "Missing")
+
+        elif applied_strategy == "knn_impute":
+            clean_df = _knn_impute_numeric(clean_df, num_cols, k=5)
+            for col in cat_cols:
+                mode_vals = clean_df[col].mode(dropna=True)
+                clean_df[col] = clean_df[col].fillna(mode_vals.iloc[0] if len(mode_vals) > 0 else "Missing")
+
+        elif applied_strategy == "ffill_bfill":
+            clean_df[feature_cols] = clean_df[feature_cols].ffill().bfill()
+            for col in num_cols:
+                clean_df[col] = clean_df[col].fillna(0.0)
+            for col in cat_cols:
+                clean_df[col] = clean_df[col].fillna("Missing")
+
+        elif applied_strategy == "constant_zero":
+            for col in num_cols:
+                clean_df[col] = clean_df[col].fillna(0.0)
+            for col in cat_cols:
+                clean_df[col] = clean_df[col].fillna("Missing")
+
+        else:
+            # Fallback to strict drop if unknown strategy string
+            applied_strategy = "drop"
+            clean_df = df.dropna(axis=0, how="any").reset_index(drop=True)
+
+        clean_df = clean_df.dropna(axis=0, how="any").reset_index(drop=True)
+
+    rows_after_nan = len(clean_df)
+    nan_rows_removed = original_rows - rows_after_nan
+
+    if rows_after_nan == 0:
+        raise ValueError("No rows remain after handling NaN values. Please try an Imputer strategy or check your dataset.")
+
+    clamped_pct = max(20.0, min(80.0, float(sample_percentage)))
+    target_sample_count = max(20, int(round(rows_after_nan * (clamped_pct / 100.0))))
+    actual_sample = min(target_sample_count, rows_after_nan)
+
+    if actual_sample < rows_after_nan:
         if task_type == "classification" and clean_df[target_col].nunique() > 1:
             parts = []
             counts = clean_df[target_col].value_counts(normalize=True)
@@ -83,7 +168,15 @@ def sample_clean_250_rows(
     else:
         sampled_df = clean_df.sample(frac=1.0, random_state=random_state).reset_index(drop=True)
 
-    return sampled_df, original_rows, rows_after_nan_drop, nan_rows_removed
+    return (
+        sampled_df,
+        original_rows,
+        rows_after_nan,
+        raw_nan_rows,
+        nan_rows_removed,
+        applied_strategy,
+        rec_reason,
+    )
 
 
 def preprocess_features(
@@ -557,12 +650,21 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResponse:
 
     inferred_task, detection_reason = intelligent_detect_task_type(df[target_col], config.task_type)
 
-    sampled_df, original_rows, rows_after_nan_drop, nan_rows_removed = sample_clean_250_rows(
+    (
+        sampled_df,
+        original_rows,
+        rows_after_nan,
+        raw_nan_rows,
+        nan_rows_removed,
+        applied_nan_strategy,
+        nan_rec_reason,
+    ) = sample_percentage_rows(
         df=df,
         target_col=target_col,
-        sample_size=config.sample_size,
+        sample_percentage=config.sample_percentage,
         random_state=config.random_state,
         task_type=inferred_task,
+        nan_strategy=config.nan_strategy,
     )
 
     X_df = sampled_df.drop(columns=[target_col])
@@ -578,7 +680,7 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResponse:
         y_all = pd.to_numeric(y_raw, errors="coerce").to_numpy(dtype=float)
 
     n_total = len(sampled_df)
-    n_test = max(8, int(round(n_total * config.test_size)))
+    n_test = max(6, int(round(n_total * config.test_size)))
     n_train = n_total - n_test
 
     X_train_df = X_df.iloc[:n_train].reset_index(drop=True)
@@ -624,7 +726,7 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResponse:
 
     results: List[ModelResult] = []
     baseline_test_score = 0.0
-    k_folds = min(config.cv_folds, 8)
+    k_folds = min(config.cv_folds, max(2, len(X_tr) // 4))
     fold_indices = np.array_split(np.arange(len(X_tr)), k_folds)
 
     for name, tier_label, tier_order, why_tier, alg_key in candidate_specs:
@@ -754,21 +856,19 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResponse:
 
     selection_rationale = (
         f"{winner.algorithm} ({winner.complexity_tier}) ranked #1 out of {len(leaderboard)} algorithms on the "
-        f"{len(sampled_df)}-row non-NaN sample. It achieved a test score of {winner.test_score:.4f} and "
-        f"{k_folds}-fold CV mean of {winner.cv_mean:.4f} (±{winner.cv_std:.4f}), outperforming the naive baseline "
-        f"({baseline_test_score:.4f}) and runner-up {runner_up.algorithm} ({runner_up.test_score:.4f}) with a "
-        f"train-test gap of {winner.overfitting_gap:.4f}."
+        f"{config.sample_percentage:.0f}% sample ({len(sampled_df)} rows after '{applied_nan_strategy}' NaN handling). "
+        f"It achieved a test score of {winner.test_score:.4f} and {k_folds}-fold CV mean of {winner.cv_mean:.4f} (±{winner.cv_std:.4f}), "
+        f"outperforming the naive baseline ({baseline_test_score:.4f}) and runner-up {runner_up.algorithm} ({runner_up.test_score:.4f})."
     )
 
     concept_takeaways = {
+        "Percentage Sampling (20%–80%)": (
+            f"Sampled {config.sample_percentage:.0f}% ({len(sampled_df)} of {rows_after_nan} post-NaN rows) using seed={config.random_state}."
+        ),
+        "NaN Handling & Suggestion": (
+            f"Applied '{applied_nan_strategy}' (requested: '{config.nan_strategy}'). {nan_rec_reason}"
+        ),
         "Intelligent Target & Task Detection": detection_reason,
-        "Clean 250-Row Sampling & NaN Filtering": (
-            f"Removed {nan_rows_removed} rows containing NaN values from {original_rows} original rows, "
-            f"then randomly sampled {len(sampled_df)} clean rows (seed={config.random_state})."
-        ),
-        "Baseline-First Methodology": (
-            f"Started at Tier 0 ({ordered_by_tier[0].algorithm}: {baseline_test_score:.4f}) and progressed through linear, distance, tree, kernel, and ensemble tiers."
-        ),
         "Feature Scaling Impact": (
             f"Current scaling is '{config.scaling}'. Distance-based (KNN) and kernel/regularized models (SVM, Logistic, Ridge/Lasso) respond strongly to scaling, while tree models remain scale-invariant."
         ),
@@ -777,10 +877,14 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResponse:
     return ExperimentResponse(
         sampling_summary=SamplingSummary(
             original_rows=original_rows,
-            rows_after_nan_drop=rows_after_nan_drop,
+            rows_after_nan_handling=rows_after_nan,
+            nan_rows_in_raw=raw_nan_rows,
             nan_rows_removed=nan_rows_removed,
+            nan_strategy_requested=config.nan_strategy,
+            nan_strategy_applied=applied_nan_strategy,
+            nan_recommendation_reason=nan_rec_reason,
             sampled_rows=len(sampled_df),
-            target_sample_size=config.sample_size,
+            sample_percentage_used=config.sample_percentage,
             train_rows=len(X_train_df),
             test_rows=len(X_test_df),
             numeric_features=numeric_cols,
@@ -802,10 +906,6 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResponse:
 
 
 def run_manual_playground(config: ManualPlaygroundConfig) -> ManualPlaygroundResponse:
-    """
-    Dedicated Manual Learning Playground: trains ONLY the single user-selected algorithm
-    with full custom hyperparameter tuning, feature exclusions, noise simulation, and diagnostic coaching.
-    """
     df, default_target, _ = load_dataset(config.dataset_id)
     target_col = config.target_column if (config.target_column and config.target_column in df.columns) else default_target
     if target_col not in df.columns:
@@ -813,23 +913,27 @@ def run_manual_playground(config: ManualPlaygroundConfig) -> ManualPlaygroundRes
 
     inferred_task, detection_reason = intelligent_detect_task_type(df[target_col], config.task_type)
 
-    # Ensure algorithm_id matches task_type; if user switched target to regression while a _clf alg was selected, adapt gracefully
     alg_map = {a["id"]: a for a in ALGORITHMS_CATALOG}
     alg_id = config.algorithm_id
     if alg_id not in alg_map or alg_map[alg_id]["task_type"] != inferred_task:
         prefix = alg_id.replace("_clf", "").replace("_reg", "")
         candidate_id = f"{prefix}_{'clf' if inferred_task == 'classification' else 'reg'}"
-        if candidate_id in alg_map:
-            alg_id = candidate_id
-        else:
-            alg_id = "rf_clf" if inferred_task == "classification" else "rf_reg"
+        alg_id = candidate_id if candidate_id in alg_map else ("rf_clf" if inferred_task == "classification" else "rf_reg")
 
     alg_meta = alg_map[alg_id]
 
-    sampled_df, original_rows, rows_after_nan_drop, nan_rows_removed = sample_clean_250_rows(
+    (
+        sampled_df,
+        original_rows,
+        rows_after_nan,
+        raw_nan_rows,
+        nan_rows_removed,
+        applied_nan_strategy,
+        nan_rec_reason,
+    ) = sample_percentage_rows(
         df=df,
         target_col=target_col,
-        sample_size=config.sample_size,
+        sample_percentage=config.sample_percentage,
         random_state=config.random_state,
         task_type=inferred_task,
         nan_strategy=config.nan_strategy,
@@ -861,7 +965,7 @@ def run_manual_playground(config: ManualPlaygroundConfig) -> ManualPlaygroundRes
             y_all = y_all + rng.normal(0, config.add_target_noise * std_y, size=len(y_all))
 
     n_total = len(sampled_df)
-    n_test = max(8, int(round(n_total * config.test_size)))
+    n_test = max(6, int(round(n_total * config.test_size)))
     n_train = n_total - n_test
 
     X_train_df = X_df.iloc[:n_train].reset_index(drop=True)
@@ -928,7 +1032,7 @@ def run_manual_playground(config: ManualPlaygroundConfig) -> ManualPlaygroundRes
         baseline_score = 0.0
     fit_ms = (time.perf_counter() - t0) * 1000.0
 
-    k_folds = min(config.cv_folds, 8)
+    k_folds = min(config.cv_folds, max(2, len(X_tr) // 4))
     fold_indices = np.array_split(np.arange(len(X_tr)), k_folds)
     cv_scores = []
     for f_idx in range(k_folds):
@@ -974,7 +1078,6 @@ def run_manual_playground(config: ManualPlaygroundConfig) -> ManualPlaygroundRes
     gap = float(train_primary - test_primary)
     diagnosis = _diagnose_bias_variance(train_primary, test_primary, baseline_score)
 
-    # Confusion Matrix or Residual Diagnostics
     confusion_data = None
     pred_diagnostics = []
     if inferred_task == "classification":
@@ -983,10 +1086,7 @@ def run_manual_playground(config: ManualPlaygroundConfig) -> ManualPlaygroundRes
         for yt, yp in zip(y_test, y_pred_te):
             if 0 <= yt < n_cls and 0 <= yp < n_cls:
                 mat[int(yt), int(yp)] += 1
-        confusion_data = {
-            "labels": [str(lbl) for lbl in class_labels],
-            "matrix": mat.tolist(),
-        }
+        confusion_data = {"labels": [str(lbl) for lbl in class_labels], "matrix": mat.tolist()}
         for i in range(min(10, len(y_test))):
             pred_diagnostics.append(
                 {
@@ -1019,26 +1119,24 @@ def run_manual_playground(config: ManualPlaygroundConfig) -> ManualPlaygroundRes
     feature_importances = {str(k): round(float(v), 4) for k, v in pairs}
 
     coaching_tips = [
-        f"Task Detection: {detection_reason}",
-        f"Generalization Check: Train Score = {train_primary:.4f} vs. Test Score = {test_primary:.4f} (Overfitting Gap = {gap:.4f}, {k_folds}-Fold CV = {cv_mean:.4f} ± {cv_std:.4f}).",
+        f"NaN Strategy Applied: '{applied_nan_strategy}' (Requested: '{config.nan_strategy}'). {nan_rec_reason}",
+        f"Sample Size: Used {config.sample_percentage:.0f}% of post-NaN dataset ({len(sampled_df)} of {rows_after_nan} rows).",
+        f"Generalization Check: Train = {train_primary:.4f} vs. Test = {test_primary:.4f} (Gap = {gap:.4f}, {k_folds}-Fold CV = {cv_mean:.4f} ± {cv_std:.4f}).",
     ]
     if gap > 0.10:
         coaching_tips.append(
-            "Overfitting Detected: Try reducing Max Depth, increasing Min Samples to Split, lowering Polynomial Degree, or increasing Regularization."
-        )
-    elif test_primary < baseline_score + 0.05:
-        coaching_tips.append(
-            "Underfitting Detected: Try increasing model capacity (higher Max Depth or n_estimators), enabling StandardScaler, or switching from Baseline/Linear to an Ensemble."
+            "Overfitting Detected: Try increasing Sample Percentage toward 80%, lowering Max Depth, or increasing Regularization."
         )
     if config.scaling == "none" and any(k in alg_id for k in ("knn", "svm", "svr", "logistic", "ridge", "lasso")):
         coaching_tips.append(
-            "Scaling Warning: You selected a distance/margin/regularized model with Scaling='none'. Switch Scaling to 'standard' to prevent large-magnitude features from dominating."
+            "Scaling Warning: Switch Scaling to 'standard' for distance/kernel/regularized models."
         )
 
     applied_hparams = {
+        "sample_percentage": config.sample_percentage,
+        "nan_strategy_applied": applied_nan_strategy,
         "scaling": config.scaling,
         "polynomial_degree": config.polynomial_degree,
-        "nan_strategy": config.nan_strategy,
         "regularization": config.regularization,
         "max_depth": config.max_depth,
         "min_samples_split": config.min_samples_split,
@@ -1057,10 +1155,14 @@ def run_manual_playground(config: ManualPlaygroundConfig) -> ManualPlaygroundRes
         complexity_tier=alg_meta["complexity_tier"],
         sampling_summary=SamplingSummary(
             original_rows=original_rows,
-            rows_after_nan_drop=rows_after_nan_drop,
+            rows_after_nan_handling=rows_after_nan,
+            nan_rows_in_raw=raw_nan_rows,
             nan_rows_removed=nan_rows_removed,
+            nan_strategy_requested=config.nan_strategy,
+            nan_strategy_applied=applied_nan_strategy,
+            nan_recommendation_reason=nan_rec_reason,
             sampled_rows=len(sampled_df),
-            target_sample_size=config.sample_size,
+            sample_percentage_used=config.sample_percentage,
             train_rows=len(X_train_df),
             test_rows=len(X_test_df),
             numeric_features=numeric_cols,
@@ -1087,9 +1189,6 @@ def run_manual_playground(config: ManualPlaygroundConfig) -> ManualPlaygroundRes
 
 
 def run_hyperparameter_sweep(req: HyperparameterSweepRequest) -> Dict[str, Any]:
-    """
-    Sweeps a single hyperparameter across a grid of values to generate a live Train vs. Test/CV Validation Curve.
-    """
     default_grids = {
         "max_depth": [1, 2, 3, 5, 8, 12, 16],
         "n_neighbors": [1, 3, 5, 9, 15, 21, 29],
@@ -1099,8 +1198,13 @@ def run_hyperparameter_sweep(req: HyperparameterSweepRequest) -> Dict[str, Any]:
     }
     grid = req.param_values if req.param_values else default_grids.get(req.param_name, [1, 3, 5, 10])
     curve = []
+    res = None
     for val in grid:
-        cfg_copy = (req.playground_config.model_copy(deep=True) if hasattr(req.playground_config, "model_copy") else req.playground_config.copy(deep=True))
+        cfg_copy = (
+            req.playground_config.model_copy(deep=True)
+            if hasattr(req.playground_config, "model_copy")
+            else req.playground_config.copy(deep=True)
+        )
         if hasattr(cfg_copy, req.param_name):
             if req.param_name in ("max_depth", "n_neighbors", "n_estimators", "min_samples_split"):
                 setattr(cfg_copy, req.param_name, int(round(val)))
@@ -1119,8 +1223,8 @@ def run_hyperparameter_sweep(req: HyperparameterSweepRequest) -> Dict[str, Any]:
     best_pt = max(curve, key=lambda x: (0.6 * x["cv_mean"] + 0.4 * x["test_score"]))
     return {
         "param_name": req.param_name,
-        "algorithm_name": res.algorithm_name,
-        "primary_metric": res.primary_metric,
+        "algorithm_name": res.algorithm_name if res else "",
+        "primary_metric": res.primary_metric if res else "",
         "best_param_value": best_pt["param_value"],
         "best_cv_mean": best_pt["cv_mean"],
         "best_test_score": best_pt["test_score"],
