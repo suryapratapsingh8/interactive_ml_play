@@ -27,14 +27,14 @@ BUILTIN_CATALOG = {
         "name": "Iris Flower Species (Botanical Classification)",
         "task_type": "classification",
         "target_column": "target",
-        "description": "3-class botanical classification (Setosa, Versicolor, Virginica) with 4 sepal/petal features and injected NaN rows to demonstrate 250-row clean sampling.",
+        "description": "3-class botanical classification (Setosa, Versicolor, Virginica) with 4 sepal/petal features and injected NaN rows.",
     },
     "wine": {
         "id": "wine",
         "name": "Wine Chemical Cultivars (Multi-Class Classification)",
         "task_type": "classification",
         "target_column": "target",
-        "description": "Chemical constituents of wines across 3 cultivars with missing values for 250-row clean sampling.",
+        "description": "Chemical constituents of wines across 3 cultivars with missing values for testing NaN strategies.",
     },
     "breast_cancer": {
         "id": "breast_cancer",
@@ -58,6 +58,86 @@ BUILTIN_CATALOG = {
         "description": "450 residential properties with square footage, bedrooms, age, transit distance, school score, neighborhood category, and missing records.",
     },
 }
+
+
+def recommend_nan_strategy(df: pd.DataFrame, target_col: Optional[str] = None) -> Tuple[str, str, float]:
+    """
+    Analyzes missingness rate, dataset size, and feature skewness to proactively suggest
+    the best NaN handling strategy before the user selects one.
+    Returns: (recommended_strategy_id, human_readable_reason, nan_row_percentage)
+    """
+    total_rows = len(df)
+    if total_rows == 0:
+        return "drop", "Dataset is empty.", 0.0
+
+    clean_rows = int(df.dropna(axis=0, how="any").shape[0])
+    nan_rows = total_rows - clean_rows
+    nan_pct = round((nan_rows / total_rows) * 100.0, 2)
+
+    if nan_rows == 0:
+        return (
+            "drop",
+            "Suggested: Drop NaN Rows — Your dataset has 0 missing rows (0.0%), so no imputation is needed.",
+            0.0,
+        )
+
+    # Check numeric columns with missing values for skewness
+    feature_cols = [c for c in df.columns if c != target_col]
+    num_cols_with_nan = [
+        c for c in feature_cols
+        if pd.api.types.is_numeric_dtype(df[c]) and df[c].isna().any()
+    ]
+    cat_cols_with_nan = [
+        c for c in feature_cols
+        if not pd.api.types.is_numeric_dtype(df[c]) and df[c].isna().any()
+    ]
+
+    max_skew = 0.0
+    for c in num_cols_with_nan:
+        s = df[c].dropna()
+        if len(s) >= 5 and s.std() > 1e-9:
+            max_skew = max(max_skew, abs(float(s.skew())))
+
+    if nan_pct <= 5.0 and clean_rows >= 150:
+        return (
+            "drop",
+            f"Suggested: Drop NaN Rows — Only {nan_pct}% of rows ({nan_rows}/{total_rows}) contain NaNs and {clean_rows} complete rows remain, so dropping avoids artificial imputation bias.",
+            nan_pct,
+        )
+
+    if nan_pct > 20.0:
+        if len(num_cols_with_nan) >= 2:
+            return (
+                "knn_impute",
+                f"Suggested: KNN Imputer — High missingness ({nan_pct}% of rows contain NaNs). Dropping would lose too much signal; KNN Imputer reconstructs missing values from similar neighbors.",
+                nan_pct,
+            )
+        return (
+            "median_mode",
+            f"Suggested: Median / Mode Imputer — High missingness ({nan_pct}% of rows). Median/Mode imputation preserves sample size cleanly.",
+            nan_pct,
+        )
+
+    # Moderate missingness: 5% to 20%
+    if max_skew > 1.0 or len(cat_cols_with_nan) > 0:
+        return (
+            "median_mode",
+            f"Suggested: Median / Mode Imputer — {nan_pct}% of rows ({nan_rows}/{total_rows}) have NaNs with skewed or mixed categorical features (max skewness {max_skew:.2f}); Median/Mode resists outliers while retaining all rows.",
+            nan_pct,
+        )
+
+    if len(num_cols_with_nan) >= 2:
+        return (
+            "knn_impute",
+            f"Suggested: KNN Imputer — {nan_pct}% of rows ({nan_rows}/{total_rows}) have NaNs across numeric features; KNN Imputer leverages feature correlations better than simple averages.",
+            nan_pct,
+        )
+
+    return (
+        "mean_mode",
+        f"Suggested: Mean / Mode Imputer — {nan_pct}% of rows have NaNs in symmetric numeric features (max skewness {max_skew:.2f}); Mean/Mode imputation preserves the distribution center.",
+        nan_pct,
+    )
 
 
 def intelligent_detect_task_type(series: pd.Series, requested: Optional[str] = "auto") -> Tuple[str, str]:
@@ -162,7 +242,7 @@ def _generate_fallback_dataset(dataset_id: str) -> Tuple[pd.DataFrame, str, str]
                     }
                 )
         df = pd.DataFrame(rows)
-        return _inject_nans_and_ensure_size(df, "target", 320), "target", "classification"
+        return _inject_nans_and_ensure_size(df, "target", 320, nan_rate=0.045), "target", "classification"
 
     if dataset_id == "wine":
         n = 360
@@ -184,7 +264,7 @@ def _generate_fallback_dataset(dataset_id: str) -> Tuple[pd.DataFrame, str, str]
                 "target": cultivar,
             }
         )
-        return _inject_nans_and_ensure_size(df, "target", 320), "target", "classification"
+        return _inject_nans_and_ensure_size(df, "target", 320, nan_rate=0.09), "target", "classification"
 
     if dataset_id == "breast_cancer":
         n = 420
@@ -204,7 +284,7 @@ def _generate_fallback_dataset(dataset_id: str) -> Tuple[pd.DataFrame, str, str]
                 "target": malignant,
             }
         )
-        return _inject_nans_and_ensure_size(df, "target", 360), "target", "classification"
+        return _inject_nans_and_ensure_size(df, "target", 360, nan_rate=0.08), "target", "classification"
 
     if dataset_id == "diabetes":
         n = 420
@@ -233,7 +313,7 @@ def _generate_fallback_dataset(dataset_id: str) -> Tuple[pd.DataFrame, str, str]
                 "target": np.round(target, 1),
             }
         )
-        return _inject_nans_and_ensure_size(df, "target", 360), "target", "regression"
+        return _inject_nans_and_ensure_size(df, "target", 360, nan_rate=0.12), "target", "regression"
 
     raise ValueError(f"Unknown dataset_id: {dataset_id}")
 
@@ -279,19 +359,19 @@ def load_dataset(dataset_id: str) -> Tuple[pd.DataFrame, str, str]:
                 "price_k": np.round(price_k, 2),
             }
         )
-        df = _inject_nans_and_ensure_size(df, "price_k", min_clean_rows=400)
+        df = _inject_nans_and_ensure_size(df, "price_k", min_clean_rows=400, nan_rate=0.14)
         return df, "price_k", "regression"
 
     if HAS_SKLEARN and dataset_id in ("iris", "wine", "breast_cancer", "diabetes"):
         loaders = {
-            "iris": (sk_datasets.load_iris, "classification"),
-            "wine": (sk_datasets.load_wine, "classification"),
-            "breast_cancer": (sk_datasets.load_breast_cancer, "classification"),
-            "diabetes": (sk_datasets.load_diabetes, "regression"),
+            "iris": (sk_datasets.load_iris, "classification", 0.045),
+            "wine": (sk_datasets.load_wine, "classification", 0.09),
+            "breast_cancer": (sk_datasets.load_breast_cancer, "classification", 0.08),
+            "diabetes": (sk_datasets.load_diabetes, "regression", 0.12),
         }
-        loader_fn, task_type = loaders[dataset_id]
+        loader_fn, task_type, nrate = loaders[dataset_id]
         raw = loader_fn(as_frame=True)
-        df = _inject_nans_and_ensure_size(raw.frame.copy(), "target", min_clean_rows=320)
+        df = _inject_nans_and_ensure_size(raw.frame.copy(), "target", min_clean_rows=320, nan_rate=nrate)
         return df, "target", task_type
 
     return _generate_fallback_dataset(dataset_id)
@@ -328,6 +408,8 @@ def inspect_dataset_columns(
         )
 
     detected_task, reason = intelligent_detect_task_type(df[resolved_target], task_override)
+    rec_nan_strategy, nan_rec_reason, nan_row_pct = recommend_nan_strategy(df, resolved_target)
+
     ds_name = (
         CUSTOM_DATASETS[dataset_id]["name"]
         if dataset_id in CUSTOM_DATASETS
@@ -341,6 +423,9 @@ def inspect_dataset_columns(
         total_rows=int(len(df)),
         clean_non_nan_rows=clean_rows,
         nan_rows_count=int(len(df) - clean_rows),
+        nan_row_pct=nan_row_pct,
+        recommended_nan_strategy=rec_nan_strategy,
+        nan_recommendation_reason=nan_rec_reason,
         columns=[str(c) for c in df.columns],
         default_target=resolved_target,
         detected_task_type=detected_task,
@@ -415,6 +500,9 @@ def register_uploaded_csv(
         "total_rows": inspection.total_rows,
         "clean_non_nan_rows": inspection.clean_non_nan_rows,
         "nan_rows_count": inspection.nan_rows_count,
+        "nan_row_pct": inspection.nan_row_pct,
+        "recommended_nan_strategy": inspection.recommended_nan_strategy,
+        "nan_recommendation_reason": inspection.nan_recommendation_reason,
         "columns": inspection.columns,
         "default_target": resolved_target,
         "detected_task_type": detected_task,
