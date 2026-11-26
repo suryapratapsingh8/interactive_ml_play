@@ -13,6 +13,7 @@ except ImportError:
     HAS_SKLEARN = False
 
 CUSTOM_DATASETS: Dict[str, Dict[str, Any]] = {}
+PROCESSED_DATASETS: Dict[str, Dict[str, Any]] = {}
 
 
 def _to_dict(model_obj: Any) -> dict:
@@ -60,11 +61,36 @@ BUILTIN_CATALOG = {
 }
 
 
+def save_processed_dataset(dataset_id: str, df: pd.DataFrame, metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """Stores the processed (NaN-handled + percentage-sampled) dataset for review and CSV download."""
+    PROCESSED_DATASETS[dataset_id] = {
+        "df": df.copy(),
+        "metadata": metadata,
+    }
+    return metadata
+
+
+def get_processed_dataset(dataset_id: str) -> Optional[Dict[str, Any]]:
+    return PROCESSED_DATASETS.get(dataset_id)
+
+
+def export_processed_csv_bytes(dataset_id: str) -> Tuple[bytes, str]:
+    entry = PROCESSED_DATASETS.get(dataset_id)
+    if not entry:
+        raise ValueError(f"No processed dataset found for '{dataset_id}'. Apply NaN handling and sampling first.")
+    df: pd.DataFrame = entry["df"]
+    meta = entry["metadata"]
+    csv_text = df.to_csv(index=False)
+    strat = meta.get("nan_strategy_applied", "clean")
+    pct = int(round(meta.get("sample_percentage_used", 60)))
+    filename = f"{dataset_id}_{strat}_{pct}pct.csv"
+    return csv_text.encode("utf-8"), filename
+
+
 def recommend_nan_strategy(df: pd.DataFrame, target_col: Optional[str] = None) -> Tuple[str, str, float]:
     """
     Analyzes missingness rate, dataset size, and feature skewness to proactively suggest
     the best NaN handling strategy before the user selects one.
-    Returns: (recommended_strategy_id, human_readable_reason, nan_row_percentage)
     """
     total_rows = len(df)
     if total_rows == 0:
@@ -77,11 +103,10 @@ def recommend_nan_strategy(df: pd.DataFrame, target_col: Optional[str] = None) -
     if nan_rows == 0:
         return (
             "drop",
-            "Suggested: Drop NaN Rows — Your dataset has 0 missing rows (0.0%), so no imputation is needed.",
+            "Suggested: Remove / Drop NaN Rows — Your dataset has 0 missing rows (0.0%), so no imputation is needed.",
             0.0,
         )
 
-    # Check numeric columns with missing values for skewness
     feature_cols = [c for c in df.columns if c != target_col]
     num_cols_with_nan = [
         c for c in feature_cols
@@ -101,7 +126,7 @@ def recommend_nan_strategy(df: pd.DataFrame, target_col: Optional[str] = None) -
     if nan_pct <= 5.0 and clean_rows >= 150:
         return (
             "drop",
-            f"Suggested: Drop NaN Rows — Only {nan_pct}% of rows ({nan_rows}/{total_rows}) contain NaNs and {clean_rows} complete rows remain, so dropping avoids artificial imputation bias.",
+            f"Suggested: Remove / Drop NaN Rows — Only {nan_pct}% of rows ({nan_rows}/{total_rows}) contain NaNs and {clean_rows} complete rows remain, so dropping avoids artificial imputation bias.",
             nan_pct,
         )
 
@@ -118,7 +143,6 @@ def recommend_nan_strategy(df: pd.DataFrame, target_col: Optional[str] = None) -
             nan_pct,
         )
 
-    # Moderate missingness: 5% to 20%
     if max_skew > 1.0 or len(cat_cols_with_nan) > 0:
         return (
             "median_mode",
@@ -141,10 +165,6 @@ def recommend_nan_strategy(df: pd.DataFrame, target_col: Optional[str] = None) -
 
 
 def intelligent_detect_task_type(series: pd.Series, requested: Optional[str] = "auto") -> Tuple[str, str]:
-    """
-    Intelligently determines whether a target column represents a Classification or Regression problem,
-    returning both the resolved task type ('classification' or 'regression') and a human-readable explanation.
-    """
     if requested and requested.lower() in ("classification", "regression"):
         mode = requested.lower()
         return mode, f"Explicitly set to '{mode}' by user selection."
@@ -512,6 +532,7 @@ def register_uploaded_csv(
 
 
 def delete_custom_dataset(dataset_id: str) -> bool:
+    PROCESSED_DATASETS.pop(dataset_id, None)
     if dataset_id in CUSTOM_DATASETS:
         del CUSTOM_DATASETS[dataset_id]
         return True

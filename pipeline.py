@@ -1,13 +1,18 @@
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
 from scipy.spatial.distance import cdist
 
 from concepts import ALGORITHMS_CATALOG
-from datasets import intelligent_detect_task_type, load_dataset, recommend_nan_strategy
+from datasets import (
+    intelligent_detect_task_type,
+    load_dataset,
+    recommend_nan_strategy,
+    save_processed_dataset,
+)
 from schemas import (
     ExperimentConfig,
     ExperimentResponse,
@@ -25,9 +30,6 @@ def detect_task_type(y: pd.Series, requested: Optional[str] = "auto") -> str:
 
 
 def _knn_impute_numeric(df_in: pd.DataFrame, numeric_cols: List[str], k: int = 5) -> pd.DataFrame:
-    """
-    Distance-weighted K-Nearest Neighbors imputation for numeric columns using standardized observed dimensions.
-    """
     df = df_in.copy()
     if not numeric_cols:
         return df
@@ -38,7 +40,6 @@ def _knn_impute_numeric(df_in: pd.DataFrame, numeric_cols: List[str], k: int = 5
     col_stds = np.nanstd(mat, axis=0)
     col_stds = np.where((np.isnan(col_stds)) | (col_stds < 1e-9), 1.0, col_stds)
 
-    # Temporarily fill with medians strictly for distance computation
     mat_filled = np.where(np.isnan(mat), col_medians, mat)
     mat_norm = (mat_filled - col_medians) / col_stds
 
@@ -48,10 +49,7 @@ def _knn_impute_numeric(df_in: pd.DataFrame, numeric_cols: List[str], k: int = 5
         obs_cols = np.where(~np.isnan(mat[r_idx]))[0]
         for c_idx in missing_cols:
             valid_donors = np.where(~np.isnan(mat[:, c_idx]))[0]
-            if len(valid_donors) == 0:
-                mat[r_idx, c_idx] = col_medians[c_idx]
-                continue
-            if len(obs_cols) == 0:
+            if len(valid_donors) == 0 or len(obs_cols) == 0:
                 mat[r_idx, c_idx] = col_medians[c_idx]
                 continue
             diff = mat_norm[valid_donors][:, obs_cols] - mat_norm[r_idx, obs_cols]
@@ -75,10 +73,9 @@ def sample_percentage_rows(
     nan_strategy: str = "auto",
 ) -> Tuple[pd.DataFrame, int, int, int, int, str, str]:
     """
-    1. Resolves NaN handling strategy ('auto' -> recommended strategy, 'drop', 'median_mode',
-       'mean_mode', 'knn_impute', 'ffill_bfill', or 'constant_zero').
-    2. Randomly samples `sample_percentage` (20% to 80%) of the processed clean rows
-       (using stratified sampling for classification to preserve class balance).
+    Stage 1: Applies NaN handling first ('auto' -> recommended, 'drop', 'median_mode',
+             'mean_mode', 'knn_impute', 'ffill_bfill', or 'constant_zero').
+    Stage 2: Randomly samples `sample_percentage` (20% to 80%) of the post-NaN rows.
     """
     original_rows = len(df)
     raw_nan_rows = int(len(df) - len(df.dropna(axis=0, how="any")))
@@ -89,7 +86,6 @@ def sample_percentage_rows(
     if applied_strategy == "drop":
         clean_df = df.dropna(axis=0, how="any").reset_index(drop=True)
     else:
-        # Target values must always be known for supervised training
         clean_df = df.dropna(subset=[target_col]).copy().reset_index(drop=True)
         feature_cols = [c for c in clean_df.columns if c != target_col]
         num_cols = [c for c in feature_cols if pd.api.types.is_numeric_dtype(clean_df[c])]
@@ -102,7 +98,6 @@ def sample_percentage_rows(
             for col in cat_cols:
                 mode_vals = clean_df[col].mode(dropna=True)
                 clean_df[col] = clean_df[col].fillna(mode_vals.iloc[0] if len(mode_vals) > 0 else "Missing")
-
         elif applied_strategy == "mean_mode":
             for col in num_cols:
                 mn = clean_df[col].mean()
@@ -110,28 +105,23 @@ def sample_percentage_rows(
             for col in cat_cols:
                 mode_vals = clean_df[col].mode(dropna=True)
                 clean_df[col] = clean_df[col].fillna(mode_vals.iloc[0] if len(mode_vals) > 0 else "Missing")
-
         elif applied_strategy == "knn_impute":
             clean_df = _knn_impute_numeric(clean_df, num_cols, k=5)
             for col in cat_cols:
                 mode_vals = clean_df[col].mode(dropna=True)
                 clean_df[col] = clean_df[col].fillna(mode_vals.iloc[0] if len(mode_vals) > 0 else "Missing")
-
         elif applied_strategy == "ffill_bfill":
             clean_df[feature_cols] = clean_df[feature_cols].ffill().bfill()
             for col in num_cols:
                 clean_df[col] = clean_df[col].fillna(0.0)
             for col in cat_cols:
                 clean_df[col] = clean_df[col].fillna("Missing")
-
         elif applied_strategy == "constant_zero":
             for col in num_cols:
                 clean_df[col] = clean_df[col].fillna(0.0)
             for col in cat_cols:
                 clean_df[col] = clean_df[col].fillna("Missing")
-
         else:
-            # Fallback to strict drop if unknown strategy string
             applied_strategy = "drop"
             clean_df = df.dropna(axis=0, how="any").reset_index(drop=True)
 
@@ -177,6 +167,61 @@ def sample_percentage_rows(
         applied_strategy,
         rec_reason,
     )
+
+
+def prepare_and_store_dataset(
+    dataset_id: str,
+    target_column: Optional[str] = None,
+    task_type: str = "auto",
+    nan_strategy: str = "auto",
+    sample_percentage: float = 60.0,
+    random_state: int = 42,
+) -> Dict[str, Any]:
+    """
+    Applies the user-chosen NaN strategy first, then samples 20%-80% of the post-NaN dataset,
+    stores the resulting clean dataset so the user can review and download it as a CSV.
+    """
+    df, default_target, _ = load_dataset(dataset_id)
+    t_col = target_column if (target_column and target_column in df.columns) else default_target
+    resolved_task, task_reason = intelligent_detect_task_type(df[t_col], task_type)
+
+    (
+        sampled_df,
+        orig_rows,
+        rows_after_nan,
+        raw_nan_rows,
+        nan_removed,
+        applied_strat,
+        rec_reason,
+    ) = sample_percentage_rows(
+        df=df,
+        target_col=t_col,
+        sample_percentage=sample_percentage,
+        random_state=random_state,
+        task_type=resolved_task,
+        nan_strategy=nan_strategy,
+    )
+
+    meta = {
+        "dataset_id": dataset_id,
+        "target_column": t_col,
+        "detected_task_type": resolved_task,
+        "task_detection_reason": task_reason,
+        "original_rows": orig_rows,
+        "raw_nan_rows": raw_nan_rows,
+        "nan_strategy_requested": nan_strategy,
+        "nan_strategy_applied": applied_strat,
+        "nan_recommendation_reason": rec_reason,
+        "rows_after_nan_handling": rows_after_nan,
+        "nan_rows_removed": nan_removed,
+        "remaining_nans_in_processed": int(sampled_df.isna().sum().sum()),
+        "sample_percentage_used": sample_percentage,
+        "sampled_rows_count": len(sampled_df),
+        "columns": [str(c) for c in sampled_df.columns],
+        "preview_rows": sampled_df.head(25).to_dict(orient="records"),
+    }
+    save_processed_dataset(dataset_id, sampled_df, meta)
+    return meta
 
 
 def preprocess_features(
@@ -642,7 +687,14 @@ def _diagnose_bias_variance(train_score: float, test_score: float, baseline_scor
     return "Well-Balanced Generalization: Strong test performance with low train-test gap."
 
 
-def run_experiment(config: ExperimentConfig) -> ExperimentResponse:
+def run_experiment(
+    config: ExperimentConfig,
+    progress_callback: Optional[Callable[[int, int, str, float, float], None]] = None,
+) -> ExperimentResponse:
+    """
+    Runs progressive Tier 0 -> Tier 6 benchmark with optional real-time progress & ETA callbacks.
+    """
+    start_ts = time.perf_counter()
     df, default_target, _ = load_dataset(config.dataset_id)
     target_col = config.target_column if (config.target_column and config.target_column in df.columns) else default_target
     if target_col not in df.columns:
@@ -665,6 +717,17 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResponse:
         random_state=config.random_state,
         task_type=inferred_task,
         nan_strategy=config.nan_strategy,
+    )
+
+    # Also store processed dataset so user can download it after running benchmark
+    save_processed_dataset(
+        config.dataset_id,
+        sampled_df,
+        {
+            "nan_strategy_applied": applied_nan_strategy,
+            "sample_percentage_used": config.sample_percentage,
+            "target_column": target_col,
+        },
     )
 
     X_df = sampled_df.drop(columns=[target_col])
@@ -724,19 +787,26 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResponse:
             ("Gradient Boosting Regressor", "Tier 6: Boosting Ensemble", 8, "Sequentially fits shallow trees to negative loss gradients.", "gb"),
         ]
 
+    total_steps = len(candidate_specs)
     results: List[ModelResult] = []
     baseline_test_score = 0.0
     k_folds = min(config.cv_folds, max(2, len(X_tr) // 4))
     fold_indices = np.array_split(np.arange(len(X_tr)), k_folds)
 
-    for name, tier_label, tier_order, why_tier, alg_key in candidate_specs:
+    if progress_callback:
+        progress_callback(0, total_steps, f"Preparing {len(sampled_df)} clean rows & starting Tier 0...", 0.0, 2.5)
+
+    for step_idx, (name, tier_label, tier_order, why_tier, alg_key) in enumerate(candidate_specs, start=1):
+        if progress_callback:
+            elapsed_now = time.perf_counter() - start_ts
+            avg_per_step = (elapsed_now / max(1, step_idx - 1)) if step_idx > 1 else 0.35
+            eta_now = avg_per_step * (total_steps - step_idx + 1)
+            progress_callback(step_idx - 1, total_steps, f"Evaluating {name} ({tier_label})...", elapsed_now, eta_now)
+
         t0 = time.perf_counter()
         if inferred_task == "classification":
             y_pred_tr, y_pred_te = _fit_predict_classifier(
-                alg_key,
-                X_tr,
-                y_train,
-                X_te,
+                alg_key, X_tr, y_train, X_te,
                 regularization=config.regularization_c_or_alpha,
                 max_depth=config.max_depth or 5,
                 n_neighbors=config.n_neighbors,
@@ -748,10 +818,7 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResponse:
             test_primary = te_m["F1 Score"]
         else:
             y_pred_tr, y_pred_te = _fit_predict_regressor(
-                alg_key,
-                X_tr,
-                y_train,
-                X_te,
+                alg_key, X_tr, y_train, X_te,
                 regularization=config.regularization_c_or_alpha,
                 max_depth=config.max_depth or 5,
                 n_neighbors=config.n_neighbors,
@@ -769,10 +836,7 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResponse:
             tr_idx = np.setdiff1d(np.arange(len(X_tr)), val_idx)
             if inferred_task == "classification":
                 _, val_pred = _fit_predict_classifier(
-                    alg_key,
-                    X_tr[tr_idx],
-                    y_train[tr_idx],
-                    X_tr[val_idx],
+                    alg_key, X_tr[tr_idx], y_train[tr_idx], X_tr[val_idx],
                     regularization=config.regularization_c_or_alpha,
                     max_depth=config.max_depth or 5,
                     n_neighbors=config.n_neighbors,
@@ -781,10 +845,7 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResponse:
                 cv_scores.append(classification_metrics(y_train[val_idx], val_pred)["F1 Score"])
             else:
                 _, val_pred = _fit_predict_regressor(
-                    alg_key,
-                    X_tr[tr_idx],
-                    y_train[tr_idx],
-                    X_tr[val_idx],
+                    alg_key, X_tr[tr_idx], y_train[tr_idx], X_tr[val_idx],
                     regularization=config.regularization_c_or_alpha,
                     max_depth=config.max_depth or 5,
                     n_neighbors=config.n_neighbors,
@@ -794,7 +855,6 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResponse:
 
         cv_mean = float(np.mean(cv_scores))
         cv_std = float(np.std(cv_scores))
-
         if tier_order == 0:
             baseline_test_score = test_primary
 
@@ -817,6 +877,12 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResponse:
                 fit_time_ms=round(fit_ms, 2),
             )
         )
+
+        if progress_callback:
+            elapsed_after = time.perf_counter() - start_ts
+            avg_step = elapsed_after / step_idx
+            eta_after = max(0.0, avg_step * (total_steps - step_idx))
+            progress_callback(step_idx, total_steps, f"Completed {name} ({step_idx}/{total_steps})", elapsed_after, eta_after)
 
     ordered_by_tier = sorted(results, key=lambda r: r.tier_order)
     best_so_far = ordered_by_tier[0]
@@ -988,18 +1054,11 @@ def run_manual_playground(config: ManualPlaygroundConfig) -> ManualPlaygroundRes
     if inferred_task == "classification":
         primary_metric = "F1 Score (Weighted)"
         y_pred_tr, y_pred_te = _fit_predict_classifier(
-            alg_id,
-            X_tr,
-            y_train,
-            X_te,
-            regularization=config.regularization,
-            max_depth=config.max_depth,
-            min_samples_split=config.min_samples_split,
-            n_neighbors=config.n_neighbors,
-            knn_weights=config.knn_weights,
-            n_estimators=config.n_estimators,
-            learning_rate=config.learning_rate,
-            kernel_gamma=config.kernel_gamma,
+            alg_id, X_tr, y_train, X_te,
+            regularization=config.regularization, max_depth=config.max_depth,
+            min_samples_split=config.min_samples_split, n_neighbors=config.n_neighbors,
+            knn_weights=config.knn_weights, n_estimators=config.n_estimators,
+            learning_rate=config.learning_rate, kernel_gamma=config.kernel_gamma,
             random_state=config.random_state,
         )
         tr_m = classification_metrics(y_train, y_pred_tr)
@@ -1011,18 +1070,11 @@ def run_manual_playground(config: ManualPlaygroundConfig) -> ManualPlaygroundRes
     else:
         primary_metric = "R2 Score (with MAE & RMSE)"
         y_pred_tr, y_pred_te = _fit_predict_regressor(
-            alg_id,
-            X_tr,
-            y_train,
-            X_te,
-            regularization=config.regularization,
-            max_depth=config.max_depth,
-            min_samples_split=config.min_samples_split,
-            n_neighbors=config.n_neighbors,
-            knn_weights=config.knn_weights,
-            n_estimators=config.n_estimators,
-            learning_rate=config.learning_rate,
-            kernel_gamma=config.kernel_gamma,
+            alg_id, X_tr, y_train, X_te,
+            regularization=config.regularization, max_depth=config.max_depth,
+            min_samples_split=config.min_samples_split, n_neighbors=config.n_neighbors,
+            knn_weights=config.knn_weights, n_estimators=config.n_estimators,
+            learning_rate=config.learning_rate, kernel_gamma=config.kernel_gamma,
             random_state=config.random_state,
         )
         tr_m = regression_metrics(y_train, y_pred_tr)
@@ -1040,35 +1092,21 @@ def run_manual_playground(config: ManualPlaygroundConfig) -> ManualPlaygroundRes
         tr_idx = np.setdiff1d(np.arange(len(X_tr)), val_idx)
         if inferred_task == "classification":
             _, val_pred = _fit_predict_classifier(
-                alg_id,
-                X_tr[tr_idx],
-                y_train[tr_idx],
-                X_tr[val_idx],
-                regularization=config.regularization,
-                max_depth=config.max_depth,
-                min_samples_split=config.min_samples_split,
-                n_neighbors=config.n_neighbors,
-                knn_weights=config.knn_weights,
-                n_estimators=config.n_estimators,
-                learning_rate=config.learning_rate,
-                kernel_gamma=config.kernel_gamma,
+                alg_id, X_tr[tr_idx], y_train[tr_idx], X_tr[val_idx],
+                regularization=config.regularization, max_depth=config.max_depth,
+                min_samples_split=config.min_samples_split, n_neighbors=config.n_neighbors,
+                knn_weights=config.knn_weights, n_estimators=config.n_estimators,
+                learning_rate=config.learning_rate, kernel_gamma=config.kernel_gamma,
                 random_state=config.random_state,
             )
             cv_scores.append(classification_metrics(y_train[val_idx], val_pred)["F1 Score"])
         else:
             _, val_pred = _fit_predict_regressor(
-                alg_id,
-                X_tr[tr_idx],
-                y_train[tr_idx],
-                X_tr[val_idx],
-                regularization=config.regularization,
-                max_depth=config.max_depth,
-                min_samples_split=config.min_samples_split,
-                n_neighbors=config.n_neighbors,
-                knn_weights=config.knn_weights,
-                n_estimators=config.n_estimators,
-                learning_rate=config.learning_rate,
-                kernel_gamma=config.kernel_gamma,
+                alg_id, X_tr[tr_idx], y_train[tr_idx], X_tr[val_idx],
+                regularization=config.regularization, max_depth=config.max_depth,
+                min_samples_split=config.min_samples_split, n_neighbors=config.n_neighbors,
+                knn_weights=config.knn_weights, n_estimators=config.n_estimators,
+                learning_rate=config.learning_rate, kernel_gamma=config.kernel_gamma,
                 random_state=config.random_state,
             )
             cv_scores.append(regression_metrics(y_train[val_idx], val_pred)["R2 Score"])
